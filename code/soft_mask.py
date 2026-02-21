@@ -5,11 +5,6 @@ from models import decode_latent
 from baseline import prepare_inputs , denoising_loop
 
 
-
-
-
-
-
 def create_soft_mask(mask, device="cuda",radius = 5):
 
 
@@ -27,17 +22,9 @@ def create_soft_mask(mask, device="cuda",radius = 5):
 
 
 
-
-
-
-
-
-
-
-
 def run_soft_mask(image, mask , prompt , device ="cuda", guidance_scale = 7.5,num_inference_steps = 50):
 
-    vae, unet, scheduler, original_latent, text_embeddings, temp, x_t = prepare_inputs(image, mask, prompt, device,num_inference_steps)
+    vae, unet, scheduler, original_latent, text_embeddings, x_t = prepare_inputs(image, prompt, device,num_inference_steps)
     mask_tensor = create_soft_mask(mask, device)
 
     x_t = denoising_loop(unet, scheduler, original_latent, text_embeddings, mask_tensor, x_t, guidance_scale)

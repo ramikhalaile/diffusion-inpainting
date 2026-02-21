@@ -21,23 +21,15 @@ def prepare_mask(mask, device="cuda"):
 
     return mask_tensor
 
-
-
-
-def prepare_inputs(image, mask , prompt , device ="cuda",num_inference_steps = 50):
+def prepare_inputs(image , prompt , device ="cuda",num_inference_steps = 50):
     vae, unet, scheduler, tokenizer, text_encoder = load_models(device)
     original_latent = encode_image(image, vae, device)
     text_embeddings = encode_text(prompt, tokenizer, text_encoder, device)
-    mask_tensor = prepare_mask(mask, device)
+   # mask_tensor = prepare_mask(mask, device)
     scheduler.set_timesteps(num_inference_steps)
     x_t = torch.randn_like(original_latent) * scheduler.init_noise_sigma
 
-    return vae, unet, scheduler,original_latent, text_embeddings ,mask_tensor, x_t
-
-
-
-
-
+    return vae, unet, scheduler,original_latent, text_embeddings , x_t
 
 def denoising_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor, x_t ,guidance_scale = 7.5):
 
@@ -67,18 +59,20 @@ def denoising_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor
 
 
 
-def run_baseline(image, mask , prompt , device ="cuda", guidance_scale = 7.5,num_inference_steps = 50):
+#def run_baseline(image, mask , prompt , device ="cuda", guidance_scale = 7.5,num_inference_steps = 50):
+#
+#   mask_tensor = prepare_mask(mask, device)
 
     # first we load the models, encode everything, prepare mask and init noise
-    vae, unet, scheduler, original_latent, text_embeddings, mask_tensor ,x_t = prepare_inputs(image, mask, prompt, device, num_inference_steps)
+ #   vae, unet, scheduler, original_latent, text_embeddings,x_t = prepare_inputs(image, mask, prompt, device, num_inference_steps)
 
 
     # we execute the loop and return the final image latent
-    x_t = denoising_loop(unet,scheduler,original_latent,text_embeddings, mask_tensor, x_t, guidance_scale)
+  #  x_t = denoising_loop(unet,scheduler,original_latent,text_embeddings, mask_tensor, x_t, guidance_scale)
 
-    generated_image = decode_latent(x_t, vae)
+   # generated_image = decode_latent(x_t, vae)
 
-    return generated_image
+    #return generated_image
 
 
 
