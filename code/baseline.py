@@ -24,15 +24,23 @@ def prepare_mask(mask, device="cuda"):
 
 
 
-
-def run_baseline(image, mask , prompt , device ="cuda", guidance_scale = 7.5,num_inference_steps = 50):
-
+def prepare_inputs(image, mask , prompt , device ="cuda",num_inference_steps = 50):
     vae, unet, scheduler, tokenizer, text_encoder = load_models(device)
     original_latent = encode_image(image, vae, device)
-    text_embeddings = encode_text(prompt,tokenizer,text_encoder, device)
+    text_embeddings = encode_text(prompt, tokenizer, text_encoder, device)
     mask_tensor = prepare_mask(mask, device)
     scheduler.set_timesteps(num_inference_steps)
     x_t = torch.randn_like(original_latent) * scheduler.init_noise_sigma
+
+    return vae, unet, scheduler,original_latent, text_embeddings ,mask_tensor, x_t
+
+
+
+
+
+
+def denoising_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor, x_t ,guidance_scale = 7.5):
+
 
     for time_step in scheduler.timesteps:
         latent_input = torch.cat([x_t, x_t])
@@ -46,19 +54,35 @@ def run_baseline(image, mask , prompt , device ="cuda", guidance_scale = 7.5,num
 
         # now we need to overwrite the noised latent we got (x_t) with the original pic noised latent
         time_step_index = (scheduler.timesteps == time_step).nonzero().item()
-        previous_step_index =  time_step_index + 1
+        previous_step_index = time_step_index + 1
         if previous_step_index >= len(scheduler.timesteps):
             noised_original_latent = original_latent
         else:
-            noised_original_latent, _ = noise_latent(original_latent ,previous_step_index , scheduler)
+            noised_original_latent, _ = noise_latent(original_latent, previous_step_index, scheduler)
 
         x_t = mask_tensor * noised_original_latent + (1 - mask_tensor) * x_t
 
+    return x_t
 
+
+
+
+def run_baseline(image, mask , prompt , device ="cuda", guidance_scale = 7.5,num_inference_steps = 50):
+
+    # first we load the models, encode everything, prepare mask and init noise
+    vae, unet, scheduler, original_latent, text_embeddings, mask_tensor ,x_t = prepare_inputs(image, mask, prompt, device, num_inference_steps)
+
+
+    # we execute the loop and return the final image latent
+    x_t = denoising_loop(unet,scheduler,original_latent,text_embeddings, mask_tensor, x_t, guidance_scale)
 
     generated_image = decode_latent(x_t, vae)
 
     return generated_image
+
+
+
+
 
 
 
