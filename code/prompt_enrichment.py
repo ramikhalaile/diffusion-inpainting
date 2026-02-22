@@ -20,11 +20,15 @@ def get_visible_region(image,mask):
 def get_blip_description(image,device):
     from transformers import Blip2Processor, Blip2ForConditionalGeneration
 
-    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    processor = Blip2Processor.from_pretrained(
+        "Salesforce/blip2-opt-2.7b",
+        use_fast=True
+    )
     model = Blip2ForConditionalGeneration.from_pretrained(
         "Salesforce/blip2-opt-2.7b",
-        torch_dtype=torch.float16
-    ).to(device)
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
     model.eval()
 
     inputs = processor(images=image, return_tensors="pt").to(device, torch.float16)
