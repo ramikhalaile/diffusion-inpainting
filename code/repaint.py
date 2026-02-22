@@ -20,17 +20,15 @@ def repaint_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor, 
 
             x_t = scheduler.step(noise_pred, time_step, x_t).prev_sample
 
-            if previous_step_index >= len(scheduler.timesteps):
-                noised_original_latent = original_latent
-            else:
-                noised_original_latent, _ = noise_latent(original_latent, previous_step_index, scheduler)
-
-            x_t = mask_tensor * noised_original_latent + (1 - mask_tensor) * x_t
-
             if r < resample_steps - 1:
                 x_t , _  = noise_latent(x_t, time_step_index, scheduler)
 
+        if previous_step_index >= len(scheduler.timesteps):
+            noised_original_latent = original_latent
+        else:
+            noised_original_latent, _ = noise_latent(original_latent, previous_step_index, scheduler)
 
+        x_t = mask_tensor * noised_original_latent + (1 - mask_tensor) * x_t
 
 
     return x_t
