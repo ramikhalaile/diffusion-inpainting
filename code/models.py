@@ -7,7 +7,7 @@ from transformers import CLIPTokenizer, CLIPTextModel
 
 
 def load_models(device="cuda"):
-    model_id = "stabilityai/stable-diffusion-2-base"
+    model_id = "sd2-community/stable-diffusion-2-base"
 
     # VAE - encodes images to latent space and decodes back
     vae = AutoencoderKL.from_pretrained(
