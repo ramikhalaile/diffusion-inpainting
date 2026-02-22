@@ -23,9 +23,10 @@ def repaint_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor, 
             if r < resample_steps - 1:
                 noise = torch.randn_like(x_t)
                 alpha_t = scheduler.alphas_cumprod[time_step.item()].to(x_t.device, dtype=x_t.dtype)
-                if time_step_index > 0:
-                    prev_t = scheduler.timesteps[time_step_index - 1].item()
-                    alpha_prev = scheduler.alphas_cumprod[prev_t].to(x_t.device, dtype=x_t.dtype)
+                next_step_index = time_step_index + 1
+                if next_step_index < len(scheduler.timesteps):
+                    next_t = scheduler.timesteps[next_step_index].item()
+                    alpha_prev = scheduler.alphas_cumprod[next_t].to(x_t.device, dtype=x_t.dtype)
                 else:
                     alpha_prev = torch.tensor(1.0, device=x_t.device, dtype=x_t.dtype)
                 beta_ratio = 1 - alpha_t / alpha_prev
