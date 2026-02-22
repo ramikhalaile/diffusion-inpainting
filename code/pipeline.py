@@ -11,6 +11,7 @@ def run_inpainting(
         prompt,
         mask_fn=None,
         loop_fn=None,
+        use_prompt_enrichment=False,
         device="cuda",
         guidance_scale=7.5,
         num_inference_steps=50,
@@ -38,6 +39,11 @@ def run_inpainting(
         mask_fn = prepare_mask
     if loop_fn is None:
         loop_fn = denoising_loop
+
+    if use_prompt_enrichment:
+        from prompt_enrichment import get_enriched_prompt
+        prompt = get_enriched_prompt(image, mask, prompt, device)
+        print(f"enriched prompt: {prompt}")
 
     # prepare mask using chosen mask function
     mask_tensor = mask_fn(mask, device)
