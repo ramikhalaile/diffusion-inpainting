@@ -120,3 +120,19 @@ def noise_latent(latent, timestep, scheduler, noise=None):
 
     return noised, noise
 
+
+def renoise_one_step(x_prev, timestep_value, scheduler, noise=None):
+    """
+    Add one step of noise: x_{t-1} -> x_t
+    Uses single-step forward formula: x_t = sqrt(alpha_t) * x_{t-1} + sqrt(1-alpha_t) * noise
+    where alpha_t = 1 - beta_t (NOT alpha_cumprod)
+    """
+    if noise is None:
+        noise = torch.randn_like(x_prev)
+
+    alpha_t = 1 - scheduler.betas[timestep_value]
+    alpha_t = alpha_t.to(x_prev.device, dtype=x_prev.dtype)
+
+    x_t = torch.sqrt(alpha_t) * x_prev + torch.sqrt(1 - alpha_t) * noise
+    return x_t, noise
+

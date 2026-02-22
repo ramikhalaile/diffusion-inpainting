@@ -1,6 +1,6 @@
 # repaint inpainting pipeline
 import torch
-from models import noise_latent
+from models import noise_latent,renoise_one_step
 
 
 
@@ -21,7 +21,15 @@ def repaint_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor, 
             x_t = scheduler.step(noise_pred, time_step, x_t).prev_sample
 
             if r < resample_steps - 1:
-                x_t , _  = noise_latent(x_t, time_step.item(), scheduler)
+                noise = torch.randn_like(x_t)
+                alpha_t = scheduler.alphas_cumprod[time_step.item()].to(x_t.device, dtype=x_t.dtype)
+                if time_step_index > 0:
+                    prev_t = scheduler.timesteps[time_step_index - 1].item()
+                    alpha_prev = scheduler.alphas_cumprod[prev_t].to(x_t.device, dtype=x_t.dtype)
+                else:
+                    alpha_prev = torch.tensor(1.0, device=x_t.device, dtype=x_t.dtype)
+                beta_ratio = 1 - alpha_t / alpha_prev
+                x_t = torch.sqrt(1 - beta_ratio) * x_t + torch.sqrt(beta_ratio) * noise
 
         if previous_step_index >= len(scheduler.timesteps):
             noised_original_latent = original_latent
