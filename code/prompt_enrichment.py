@@ -17,7 +17,7 @@ def get_visible_region(image,mask):
 
 
 
-def get_blip_description(image,device):
+def get_blip_description(image, device):
     from transformers import Blip2Processor, Blip2ForConditionalGeneration
 
     processor = Blip2Processor.from_pretrained(
@@ -41,7 +41,6 @@ def get_blip_description(image,device):
     torch.cuda.empty_cache()
 
     return caption
-
 
 
 def merge_prompts(caption, user_prompt, device):
