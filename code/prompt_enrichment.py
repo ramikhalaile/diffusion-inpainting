@@ -43,7 +43,14 @@ def get_blip_description(image, device):
     return caption
 
 
+
 def merge_prompts(caption, user_prompt, device):
+    """Merge caption and user prompt into enriched prompt."""
+    enriched = f"{user_prompt}, in a scene with {caption}"
+    return enriched
+
+
+def _merge_prompts(caption, user_prompt, device):
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
     model_name = "Qwen/Qwen2.5-1.5B-Instruct"
