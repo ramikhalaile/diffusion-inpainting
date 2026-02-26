@@ -22,7 +22,7 @@ def get_blip_description(image,device):
 
     processor = Blip2Processor.from_pretrained(
         "Salesforce/blip2-opt-2.7b",
-        use_fast=True
+        use_fast=False
     )
     model = Blip2ForConditionalGeneration.from_pretrained(
         "Salesforce/blip2-opt-2.7b",
