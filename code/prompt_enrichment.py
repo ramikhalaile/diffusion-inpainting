@@ -4,16 +4,31 @@ from PIL import Image
 import numpy as np
 
 
-
-
-
-def get_visible_region(image,mask):
+def get_visible_region(image, mask):
+    """Return only the visible (unmasked) border region, cropped to avoid the black hole."""
     image_np = np.array(image.convert("RGB"))
     mask_np = np.array(mask.convert("L"))
+
+    # find the visible rows and columns (where mask is white)
+    visible_rows = np.any(mask_np > 128, axis=1)
+    visible_cols = np.any(mask_np > 128, axis=0)
+
+    # get bounding box of visible region
+    row_min, row_max = np.where(visible_rows)[0][[0, -1]]
+    col_min, col_max = np.where(visible_cols)[0][[0, -1]]
+
+    # black out the hole but keep the full image for context
     visible_np = image_np.copy()
     visible_np[mask_np == 0] = 0
-    return Image.fromarray(visible_np)
 
+    # crop to a region that avoids the center black hole
+    # take top strip - pure visible area above the mask
+    top_strip = image_np[:row_min, :]
+    if top_strip.shape[0] > 20:  # only use if meaningful height
+        return Image.fromarray(top_strip)
+
+    # fallback - return full image with hole blacked out
+    return Image.fromarray(visible_np)
 
 
 
