@@ -51,24 +51,30 @@ def _get_blip_caption(image, device):
     )
     model.eval()
 
-    # ask a specific question to get scene context, not object description
-    question = "Question: What is the setting, environment and lighting in this image? Answer:"
-    inputs = processor(
-        images=image,
-        text=question,
-        return_tensors="pt"
-    ).to(device, torch.float16)
+    questions = [
+        "Question: What is the setting and environment in this image? Answer:",
+        "Question: What are the colors, materials and lighting in this image? Answer:",
+    ]
 
-    with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=50)
+    answers = []
+    for question in questions:
+        inputs = processor(
+            images=image,
+            text=question,
+            return_tensors="pt"
+        ).to(device, torch.float16)
 
-    caption = processor.decode(output[0], skip_special_tokens=True).strip()
+        with torch.no_grad():
+            output = model.generate(**inputs, max_new_tokens=30)
+
+        answer = processor.decode(output[0], skip_special_tokens=True).strip()
+        if answer:
+            answers.append(answer)
 
     del model
     torch.cuda.empty_cache()
 
-    return caption
-
+    return ", ".join(answers)
 
 def _merge_prompts(caption, user_prompt):
     """Merge scene caption with user prompt using a structured template."""
