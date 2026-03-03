@@ -51,7 +51,6 @@ def _blur_fill_mask(image, mask):
 
 
 def _get_blip_caption(image, device):
-    """Use BLIP-2 to caption the scene."""
     from transformers import Blip2Processor, Blip2ForConditionalGeneration
 
     processor = Blip2Processor.from_pretrained(
@@ -65,7 +64,14 @@ def _get_blip_caption(image, device):
     )
     model.eval()
 
-    inputs = processor(images=image, return_tensors="pt").to(device, torch.float16)
+    # ask a specific question to get scene context, not object description
+    question = "Question: What is the setting, environment and lighting in this image? Answer:"
+    inputs = processor(
+        images=image,
+        text=question,
+        return_tensors="pt"
+    ).to(device, torch.float16)
+
     with torch.no_grad():
         output = model.generate(**inputs, max_new_tokens=50)
 
