@@ -77,13 +77,7 @@ def _get_blip_caption(image, device):
     return caption
 
 
-def _merge_prompts(caption, user_prompt, tokenizer, text_encoder):
-    from compel import Compel
-
-    compel_proc = Compel(tokenizer=tokenizer, text_encoder=text_encoder)
-
-    # upweight scene context from caption
-    weighted_prompt = f"{user_prompt}, ({caption})1.3"
-
-    prompt_embeds = compel_proc(weighted_prompt)
-    return prompt_embeds
+def _merge_prompts(caption, user_prompt):
+    """Merge scene caption with user prompt using a structured template."""
+    enriched = f"{user_prompt}, {caption}"
+    return enriched
