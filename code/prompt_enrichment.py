@@ -1,38 +1,57 @@
-# context aware prompt enrichment
 import torch
-from PIL import Image
 import numpy as np
+from PIL import Image, ImageFilter
 
 
-def get_visible_region(image, mask):
-    """Return only the visible (unmasked) border region, cropped to avoid the black hole."""
+def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
+    """
+    Enrich user prompt with visual context from the scene.
+
+    Args:
+        image: PIL Image - original image (512x512)
+        mask: PIL Image - binary mask, white=known, black=fill
+        user_prompt: str - original user prompt
+        device: str - cuda or cpu
+
+    Returns:
+        str - enriched prompt, or original prompt if enrichment fails
+    """
+    try:
+        # step 1 - blur-fill the masked region
+        context_image = _blur_fill_mask(image, mask)
+
+        # step 2 - caption the scene with BLIP-2
+        caption = _get_blip_caption(context_image, device)
+        if not caption:
+            return user_prompt
+
+        # step 3 - merge caption with user prompt
+        enriched = _merge_prompts(caption, user_prompt)
+
+        return enriched
+
+    except Exception as e:
+        print(f"Prompt enrichment failed: {e}. Falling back to original prompt.")
+        return user_prompt
+
+
+def _blur_fill_mask(image, mask):
+    """Fill the masked region with blurred surrounding context."""
     image_np = np.array(image.convert("RGB"))
     mask_np = np.array(mask.convert("L"))
 
-    # find the visible rows and columns (where mask is white)
-    visible_rows = np.any(mask_np > 128, axis=1)
-    visible_cols = np.any(mask_np > 128, axis=0)
+    # create heavily blurred version of the image
+    blurred = np.array(image.filter(ImageFilter.GaussianBlur(radius=20)))
 
-    # get bounding box of visible region
-    row_min, row_max = np.where(visible_rows)[0][[0, -1]]
-    col_min, col_max = np.where(visible_cols)[0][[0, -1]]
+    # fill hole with blurred pixels
+    result = image_np.copy()
+    result[mask_np == 0] = blurred[mask_np == 0]
 
-    # black out the hole but keep the full image for context
-    visible_np = image_np.copy()
-    visible_np[mask_np == 0] = 0
-
-    # crop to a region that avoids the center black hole
-    # take top strip - pure visible area above the mask
-    top_strip = image_np[:row_min, :]
-    if top_strip.shape[0] > 20:  # only use if meaningful height
-        return Image.fromarray(top_strip)
-
-    # fallback - return full image with hole blacked out
-    return Image.fromarray(visible_np)
+    return Image.fromarray(result)
 
 
-
-def get_blip_description(image, device):
+def _get_blip_caption(image, device):
+    """Use BLIP-2 to caption the scene."""
     from transformers import Blip2Processor, Blip2ForConditionalGeneration
 
     processor = Blip2Processor.from_pretrained(
@@ -58,72 +77,13 @@ def get_blip_description(image, device):
     return caption
 
 
+def _merge_prompts(caption, user_prompt, tokenizer, text_encoder):
+    from compel import Compel
 
-def merge_prompts(caption, user_prompt, device):
-    """Merge caption and user prompt into enriched prompt."""
-    enriched = f"{user_prompt}, in a scene with {caption}"
-    return enriched
+    compel_proc = Compel(tokenizer=tokenizer, text_encoder=text_encoder)
 
+    # upweight scene context from caption
+    weighted_prompt = f"{user_prompt}, ({caption})1.3"
 
-def _merge_prompts(caption, user_prompt, device):
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-
-    model_name = "Qwen/Qwen2.5-1.5B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16
-    ).to(device)
-    model.eval()
-
-    instruction = (
-        f"You are helping with image inpainting. "
-        f"The visible part of the image shows: '{caption}'. "
-        f"The user wants to generate: '{user_prompt}'. "
-        f"Write a single concise image generation prompt that combines both. "
-        f"Output only the prompt, nothing else."
-    )
-
-    messages = [{"role": "user", "content": instruction}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-    inputs = tokenizer([text], return_tensors="pt").to(device)
-
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=77,
-            do_sample=False
-        )
-
-    new_tokens = output[0][inputs.input_ids.shape[1]:]
-    enriched = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
-
-    del model
-    torch.cuda.empty_cache()
-
-    return enriched
-
-
-
-
-
-def get_enriched_prompt(image,mask,user_prompt,device="cuda"):
-
-    try:
-        visible_region = get_visible_region(image,mask)
-        description = get_blip_description(visible_region,device)
-        if not description:
-            return user_prompt
-
-        enriched_prompt = merge_prompts(description,user_prompt,device)
-        if not enriched_prompt:
-            return user_prompt
-        return enriched_prompt
-    except Exception as e:
-        print(f"Prompt enrichment failed: {e}. Falling back to original prompt.")
-        return user_prompt
-
+    prompt_embeds = compel_proc(weighted_prompt)
+    return prompt_embeds

@@ -21,15 +21,19 @@ def prepare_mask(mask, device="cuda"):
 
     return mask_tensor
 
-def prepare_inputs(image , prompt , device ="cuda",num_inference_steps = 50):
-    vae, unet, scheduler, tokenizer, text_encoder = load_models(device)
+def prepare_inputs(image, prompt, device="cuda", num_inference_steps=50,
+                   vae=None, unet=None, scheduler=None,
+                   tokenizer=None, text_encoder=None, text_embeddings=None):
+
     original_latent = encode_image(image, vae, device)
-    text_embeddings = encode_text(prompt, tokenizer, text_encoder, device)
-   # mask_tensor = prepare_mask(mask, device)
+
+    if text_embeddings is None:
+        text_embeddings = encode_text(prompt, tokenizer, text_encoder, device)
+
     scheduler.set_timesteps(num_inference_steps)
     x_t = torch.randn_like(original_latent) * scheduler.init_noise_sigma
 
-    return vae, unet, scheduler,original_latent, text_embeddings , x_t
+    return vae, unet, scheduler, original_latent, text_embeddings, x_t
 
 def denoising_loop(unet, scheduler,original_latent, text_embeddings, mask_tensor, x_t ,guidance_scale = 7.5):
 

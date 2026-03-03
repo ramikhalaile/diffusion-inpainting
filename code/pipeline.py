@@ -1,5 +1,5 @@
 import torch
-from models import decode_latent
+from models import load_models, encode_text, decode_latent
 from baseline import prepare_inputs, prepare_mask, denoising_loop
 from soft_mask import create_soft_mask
 from repaint import repaint_loop
@@ -17,48 +17,43 @@ def run_inpainting(
         num_inference_steps=50,
         **loop_kwargs
 ):
-    """
-    Unified inpainting pipeline.
-
-    Args:
-        image: PIL Image - original image
-        mask: PIL Image - binary mask, white=known, black=fill
-        prompt: str - text prompt
-        mask_fn: function - mask preparation function (default: prepare_mask)
-        loop_fn: function - denoising loop function (default: denoising_loop)
-        device: str - cuda or cpu
-        guidance_scale: float - CFG scale
-        num_inference_steps: int - number of denoising steps
-        **loop_kwargs: extra args passed to loop_fn (e.g. resample_steps for repaint)
-
-    Returns:
-        PIL Image - inpainted result
-    """
-    # set defaults
     if mask_fn is None:
         mask_fn = prepare_mask
     if loop_fn is None:
         loop_fn = denoising_loop
 
+    # load models once
+    vae, unet, scheduler, tokenizer, text_encoder = load_models(device)
+
+    # handle prompt enrichment
     if use_prompt_enrichment:
         from prompt_enrichment import get_enriched_prompt
-        prompt = get_enriched_prompt(image, mask, prompt, device)
-        print(f"enriched prompt: {prompt}")
+        from compel import Compel
 
-    # prepare mask using chosen mask function
+        enriched = get_enriched_prompt(image, mask, prompt, device)
+        print(f"enriched prompt: {enriched}")
+
+        compel_proc = Compel(tokenizer=tokenizer, text_encoder=text_encoder)
+        text_embeddings = compel_proc(enriched)
+    else:
+        text_embeddings = encode_text(prompt, tokenizer, text_encoder, device)
+
+    # prepare mask
     mask_tensor = mask_fn(mask, device)
 
-    # prepare everything else
+    # prepare inputs - models already loaded, embeddings already computed
     vae, unet, scheduler, original_latent, text_embeddings, x_t = prepare_inputs(
-        image, prompt, device, num_inference_steps
+        image, prompt, device, num_inference_steps,
+        vae=vae, unet=unet, scheduler=scheduler,
+        tokenizer=tokenizer, text_encoder=text_encoder,
+        text_embeddings=text_embeddings
     )
 
-    # run chosen loop
+    # run loop
     x_t = loop_fn(
         unet, scheduler, original_latent,
         text_embeddings, mask_tensor, x_t,
         guidance_scale, **loop_kwargs
     )
 
-    # decode and return
     return decode_latent(x_t, vae)
