@@ -4,31 +4,18 @@ from PIL import Image, ImageFilter
 
 
 def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
-    """
-    Enrich user prompt with visual context from the scene.
-
-    Args:
-        image: PIL Image - original image (512x512)
-        mask: PIL Image - binary mask, white=known, black=fill
-        user_prompt: str - original user prompt
-        device: str - cuda or cpu
-
-    Returns:
-        str - enriched prompt, or original prompt if enrichment fails
-    """
     try:
-        # step 1 - blur-fill the masked region
-        context_image = _blur_fill_mask(image, mask)
-
-        # step 2 - caption the scene with BLIP-2
-        caption = _get_blip_caption(context_image, device)
+        # use full original image - blur-fill confuses BLIP-2
+        caption = _get_blip_caption(image, device)
         if not caption:
             return user_prompt
 
-        # step 3 - merge caption with user prompt
         enriched = _merge_prompts(caption, user_prompt)
-
         return enriched
+
+    except Exception as e:
+        print(f"Prompt enrichment failed: {e}. Falling back to original prompt.")
+        return user_prompt
 
     except Exception as e:
         print(f"Prompt enrichment failed: {e}. Falling back to original prompt.")
