@@ -82,7 +82,7 @@ def _get_scene_description(masked_image, user_prompt, device):
     )
     inputs = processor(
         text=[text], images=[masked_image], return_tensors="pt"
-    ).to(device)
+    ).to("cuda")
 
     with torch.no_grad():
         output = model.generate(
