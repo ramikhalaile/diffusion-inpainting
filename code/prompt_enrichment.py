@@ -58,13 +58,9 @@ def _get_scene_description(masked_image, user_prompt, device):
     ).eval()
 
     instruction = (
-        f"The black region in this image is a masked area for inpainting. "
-        f"The user wants to generate: \"{user_prompt}\". "
-        f"Look at the visible surroundings only. "
-        f"Output a single image generation prompt using this exact structure: "
-        f"[subject], [environment and background], [lighting and atmosphere], "
-        f"[materials and textures], masterpiece, photorealistic, high quality. "
-        f"Output only the prompt. No explanation. No commentary."
+        f"The black region in this image is a masked area. "
+        f"The user wants to place: \"{user_prompt}\" in that region. "
+        f"Describe the visible scene background, lighting and environment in one sentence."
     )
 
     messages = [
@@ -87,17 +83,19 @@ def _get_scene_description(masked_image, user_prompt, device):
     with torch.no_grad():
         output = model.generate(
             **inputs,
-            max_new_tokens=77,
+            max_new_tokens=50,
             do_sample=True,
             temperature=0.7
         )
 
-    result = processor.decode(
+    scene = processor.decode(
         output[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
     ).strip()
 
     del model
     torch.cuda.empty_cache()
 
-    print(f"Qwen2-VL output: {result}")
+    result = f"{user_prompt}, {scene}, masterpiece, photorealistic, high quality"
+    print(f"Qwen2-VL scene: {scene}")
+    print(f"enriched prompt: {result}")
     return result
