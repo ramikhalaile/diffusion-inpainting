@@ -6,7 +6,7 @@ from PIL import Image
 def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
     """
     Enrich user prompt using Qwen2-VL to extract scene context
-    from the visible (unmasked) region of the image.
+    from the original image.
 
     Args:
         image: PIL Image - original image
@@ -15,18 +15,13 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         device: str - cuda or cpu
 
     Returns:
-        str - enriched prompt with Compel weighting syntax,
-              or original prompt if enrichment fails
+        str - enriched prompt, or original prompt if enrichment fails
     """
     try:
-        # apply mask - black out the region to be filled
-        masked_image = _apply_mask(image, mask)
-
-        # get structured scene description from Qwen2-VL
-        scene_prompt = _get_scene_description(masked_image, user_prompt, device)
+        # pass original image - no black region to confuse the model
+        scene_prompt = _get_scene_description(image, user_prompt, device)
         if not scene_prompt:
             return user_prompt
-
         return scene_prompt
 
     except Exception as e:
@@ -34,19 +29,10 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         return user_prompt
 
 
-def _apply_mask(image, mask):
-    """Black out the masked region so VLM focuses on visible surroundings."""
-    image_np = np.array(image.convert("RGB"))
-    mask_np = np.array(mask.convert("L"))
-    masked = image_np.copy()
-    masked[mask_np == 0] = 0
-    return Image.fromarray(masked)
-
-
-def _get_scene_description(masked_image, user_prompt, device):
+def _get_scene_description(image, user_prompt, device):
     """
-    Use Qwen2-VL to generate a structured inpainting prompt
-    based on visible scene context and user intent.
+    Use Qwen2-VL to extract scene context and build enriched prompt.
+    Uses few-shot prompting with affirmative focus for reliable output.
     """
     from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 
@@ -58,16 +44,22 @@ def _get_scene_description(masked_image, user_prompt, device):
     ).eval()
 
     instruction = (
-        f"The black region in this image is a masked area. "
-        f"The user wants to place: \"{user_prompt}\" in that region. "
-        f"Describe the visible scene background, lighting and environment in one sentence."
+        "You are an expert environment analyst. "
+        "Describe the background setting, lighting, and atmosphere of this scene.\n"
+        "Rules:\n"
+        "1. Focus ONLY on the location type, materials, time of day, and lighting atmosphere.\n"
+        "2. Output a maximum of 15 words.\n"
+        "3. Format as a comma-separated list of keywords.\n\n"
+        "Example 1: Output: dimly lit coffee shop, brick walls, neon ambient glow, cinematic mood\n"
+        "Example 2: Output: bright minimalist bedroom, white walls, soft morning sunlight, airy atmosphere\n\n"
+        "Your turn: Output:"
     )
 
     messages = [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": masked_image},
+                {"type": "image", "image": image},
                 {"type": "text", "text": instruction}
             ]
         }
@@ -77,13 +69,13 @@ def _get_scene_description(masked_image, user_prompt, device):
         messages, tokenize=False, add_generation_prompt=True
     )
     inputs = processor(
-        text=[text], images=[masked_image], return_tensors="pt"
+        text=[text], images=[image], return_tensors="pt"
     ).to("cuda")
 
     with torch.no_grad():
         output = model.generate(
             **inputs,
-            max_new_tokens=50,
+            max_new_tokens=30,
             do_sample=True,
             temperature=0.7
         )
@@ -91,6 +83,13 @@ def _get_scene_description(masked_image, user_prompt, device):
     scene = processor.decode(
         output[0][inputs.input_ids.shape[1]:], skip_special_tokens=True
     ).strip()
+
+    # strip "Output:" prefix if model included it
+    if scene.lower().startswith("output:"):
+        scene = scene[7:].strip()
+
+    # enforce 15 word limit
+    scene = " ".join(scene.split()[:15])
 
     del model
     torch.cuda.empty_cache()
