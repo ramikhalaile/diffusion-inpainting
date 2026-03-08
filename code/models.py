@@ -1,4 +1,3 @@
-
 import torch
 import numpy as np
 from PIL import Image
@@ -35,7 +34,19 @@ def load_models(device="cuda"):
     return vae, unet, scheduler, tokenizer, text_encoder
 
 
-def encode_text(prompt, tokenizer, text_encoder, device="cuda"):
+def encode_text(prompt, tokenizer, text_encoder, device="cuda", negative_prompt=""):
+    """
+    Encode prompt and negative prompt into embeddings for classifier-free guidance.
+
+    In classifier-free guidance, the UNet runs twice per step:
+      1. Once with the "unconditional" (negative) embedding -> noise_pred_uncond
+      2. Once with the text embedding -> noise_pred_text
+    Then: final_pred = uncond + guidance_scale * (text - uncond)
+
+    By default, the unconditional embedding is just an empty string "".
+    With a negative prompt, we replace "" with something like "blurry, low quality"
+    which actively steers the model AWAY from those concepts.
+    """
     # encode the actual prompt
     text_inputs = tokenizer(
         prompt,
@@ -49,9 +60,10 @@ def encode_text(prompt, tokenizer, text_encoder, device="cuda"):
             text_inputs.input_ids.to(device)
         )[0]
 
-    # encode empty prompt for classifier-free guidance
+    # encode negative prompt for classifier-free guidance
+    # if negative_prompt is "" this behaves exactly like before
     uncond_inputs = tokenizer(
-        "",
+        negative_prompt,
         padding="max_length",
         max_length=tokenizer.model_max_length,
         truncation=True,
@@ -135,4 +147,3 @@ def renoise_one_step(x_prev, timestep_value, scheduler, noise=None):
 
     x_t = torch.sqrt(alpha_t) * x_prev + torch.sqrt(1 - alpha_t) * noise
     return x_t, noise
-
