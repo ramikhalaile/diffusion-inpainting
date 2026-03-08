@@ -4,8 +4,7 @@ Unified inpainting pipeline.
 Runs all combinations of improvements:
   - mask_fn: prepare_mask (hard) or create_soft_mask (soft)
   - loop_fn: denoising_loop (baseline) or repaint_loop (resampling)
-  - use_prompt_enrichment: enrich prompt with Florence-2 scene tags
-  - use_negative_prompt: steer away from artifacts via negative conditioning
+  - use_prompt_enrichment: enrich prompt with BLIP-VQA scene tags
 
 Models are loaded ONCE and reused across all calls.
 """
@@ -15,9 +14,7 @@ from models import load_models, encode_text, decode_latent
 from baseline import prepare_inputs, prepare_mask, denoising_loop
 from soft_mask import create_soft_mask
 from repaint import repaint_loop
-from prompt_enrichment import (
-    get_enriched_prompt, unload_florence, NEGATIVE_PROMPT
-)
+from prompt_enrichment import get_enriched_prompt, unload_caption_model
 
 
 def run_inpainting(
@@ -27,7 +24,6 @@ def run_inpainting(
         mask_fn=None,
         loop_fn=None,
         use_prompt_enrichment=False,
-        use_negative_prompt=False,
         device="cuda",
         guidance_scale=7.5,
         num_inference_steps=50,
@@ -51,14 +47,8 @@ def run_inpainting(
         final_prompt = get_enriched_prompt(image, mask, prompt, device)
         print(f"Final prompt: {final_prompt}")
 
-    # build negative prompt string (empty string = original behavior)
-    neg_prompt = NEGATIVE_PROMPT if use_negative_prompt else ""
-
-    # encode text with optional negative prompt
-    text_embeddings = encode_text(
-        final_prompt, tokenizer, text_encoder, device,
-        negative_prompt=neg_prompt
-    )
+    # encode text
+    text_embeddings = encode_text(final_prompt, tokenizer, text_encoder, device)
 
     # prepare mask
     mask_tensor = mask_fn(mask, device)
@@ -95,20 +85,19 @@ def run_all_conditions(
     The 8 conditions are every combination of:
       - mask: hard vs soft
       - loop: baseline vs repaint
-      - prompt: original vs enriched (with negative prompt)
+      - prompt: original vs enriched
 
     If save_dir is provided, saves each result as a PNG.
     """
-    from PIL import Image as PILImage
     import os
 
     # Step 1: Run prompt enrichment BEFORE loading SD-2
-    # Florence-2 is ~0.5GB, SD-2 is ~5GB. We load Florence, get tags, unload, then load SD-2.
+    # BLIP-VQA is ~1GB, SD-2 is ~5GB. We load BLIP, get tags, unload, then load SD-2.
     print("=" * 60)
-    print("Step 1: Enriching prompt with Florence-2...")
+    print("Step 1: Enriching prompt with BLIP-VQA...")
     print("=" * 60)
     enriched_prompt = get_enriched_prompt(image, mask, prompt, device)
-    unload_florence()  # free VRAM before loading SD-2
+    unload_caption_model()  # free VRAM before loading SD-2
 
     # Step 2: Load SD-2 models once
     print("=" * 60)
@@ -116,53 +105,51 @@ def run_all_conditions(
     print("=" * 60)
     vae, unet, scheduler, tokenizer, text_encoder = load_models(device)
 
-    # Define the 8 conditions
+    # Define the 8 conditions: 4 without enrichment, 4 with enrichment
     conditions = {
         # Without prompt enrichment
         "baseline": dict(
             mask_fn=prepare_mask, loop_fn=denoising_loop,
-            use_prompt_enrichment=False, use_negative_prompt=False,
+            enriched=False,
         ),
         "soft_mask": dict(
             mask_fn=create_soft_mask, loop_fn=denoising_loop,
-            use_prompt_enrichment=False, use_negative_prompt=False,
+            enriched=False,
         ),
         "repaint": dict(
             mask_fn=prepare_mask, loop_fn=repaint_loop,
-            use_prompt_enrichment=False, use_negative_prompt=False,
+            enriched=False,
             resample_steps=resample_steps,
         ),
         "soft_mask_repaint": dict(
             mask_fn=create_soft_mask, loop_fn=repaint_loop,
-            use_prompt_enrichment=False, use_negative_prompt=False,
+            enriched=False,
             resample_steps=resample_steps,
         ),
-        # With prompt enrichment + negative prompt
+        # With prompt enrichment
         "baseline_enriched": dict(
             mask_fn=prepare_mask, loop_fn=denoising_loop,
-            use_prompt_enrichment=False, use_negative_prompt=True,
+            enriched=True,
         ),
         "soft_mask_enriched": dict(
             mask_fn=create_soft_mask, loop_fn=denoising_loop,
-            use_prompt_enrichment=False, use_negative_prompt=True,
+            enriched=True,
         ),
         "repaint_enriched": dict(
             mask_fn=prepare_mask, loop_fn=repaint_loop,
-            use_prompt_enrichment=False, use_negative_prompt=True,
+            enriched=True,
             resample_steps=resample_steps,
         ),
         "soft_mask_repaint_enriched": dict(
             mask_fn=create_soft_mask, loop_fn=repaint_loop,
-            use_prompt_enrichment=False, use_negative_prompt=True,
+            enriched=True,
             resample_steps=resample_steps,
         ),
     }
 
-    # Pre-encode both prompts (original and enriched) to avoid re-encoding per condition
-    text_emb_original = encode_text(prompt, tokenizer, text_encoder, device, negative_prompt="")
-    text_emb_neg = encode_text(prompt, tokenizer, text_encoder, device, negative_prompt=NEGATIVE_PROMPT)
-    text_emb_enriched = encode_text(enriched_prompt, tokenizer, text_encoder, device, negative_prompt="")
-    text_emb_enriched_neg = encode_text(enriched_prompt, tokenizer, text_encoder, device, negative_prompt=NEGATIVE_PROMPT)
+    # Pre-encode both prompts to avoid re-encoding per condition
+    text_emb_original = encode_text(prompt, tokenizer, text_encoder, device)
+    text_emb_enriched = encode_text(enriched_prompt, tokenizer, text_encoder, device)
 
     results = {}
 
@@ -172,18 +159,8 @@ def run_all_conditions(
         print(f"{'=' * 60}")
 
         # Select the right pre-encoded embeddings
-        is_enriched = "enriched" in name
-        is_neg = kwargs.pop("use_negative_prompt")
-        kwargs.pop("use_prompt_enrichment")
-
-        if is_enriched and is_neg:
-            text_embeddings = text_emb_enriched_neg
-        elif is_enriched:
-            text_embeddings = text_emb_enriched
-        elif is_neg:
-            text_embeddings = text_emb_neg
-        else:
-            text_embeddings = text_emb_original
+        is_enriched = kwargs.pop("enriched")
+        text_embeddings = text_emb_enriched if is_enriched else text_emb_original
 
         mask_fn = kwargs.pop("mask_fn")
         loop_fn = kwargs.pop("loop_fn")
