@@ -1,158 +1,170 @@
 """
-Prompt enrichment using Florence-2 for scene context extraction.
+Prompt enrichment using BLIP VQA for scene context extraction.
 
-The idea: SD-2's text encoder (CLIP) works best with descriptive, tag-style prompts.
-A user might write "a wooden table on a patio" but SD-2 needs more context about
-the scene (lighting, materials, style) to generate content that blends seamlessly.
+The idea: SD-2's text encoder (CLIP) works best with descriptive prompts.
+A user might write "a wooden table on a patio" but SD-2 needs more context
+about the scene (lighting, materials, atmosphere) to generate content that
+blends seamlessly with the existing image.
 
-Florence-2 analyzes the original image and extracts scene descriptors as
-comma-separated tags — exactly the format SD-2 expects. We merge these with the
-user's prompt to create a richer conditioning signal.
+BLIP-VQA answers targeted questions about the scene environment — flooring,
+lighting, colors, indoor/outdoor. Each answer becomes a scene tag that we
+merge with the user's prompt.
+
+Key design decision: we ask NARROW questions that cannot be answered with
+the name of the object being removed. "What is the flooring?" can't be
+answered with "a chair." This avoids the problem we had with Qwen2-VL and
+open-ended captioning models that kept describing the masked object.
 
 Pipeline:
-  1. Feed original image to Florence-2 (the FULL image, not the masked version)
-  2. Get scene description (e.g., "modern outdoor patio, warm natural light, lush plants")
-  3. Merge: "{user_prompt}, {scene_tags}, masterpiece, photorealistic, high quality"
-  4. Return enriched prompt for SD-2
+  1. Feed original image to BLIP-VQA (the FULL image, not masked)
+  2. Ask 4 targeted environment questions
+  3. Collect answers as scene tags
+  4. Merge: "{user_prompt}, {tag1}, {tag2}, ..."
+  5. Return enriched prompt for SD-2
+
+Why BLIP-VQA-base:
+  - Only ~1GB — loads/unloads fast, minimal VRAM pressure alongside SD-2
+  - VQA format lets us control exactly what aspects of the scene get described
+  - Answers are short (1-4 words) — already in tag format, no conversion needed
+  - No dependency issues with transformers 4.38.0
 """
 
 import torch
 from PIL import Image
 
 # Module-level cache so we don't reload for every image in a batch
-_florence_model = None
-_florence_processor = None
+_blip_model = None
+_blip_processor = None
+
+# Scene questions — each targets a different aspect of the environment
+# Designed so the answer is NEVER the object being inpainted
+SCENE_QUESTIONS = [
+    "What type of flooring or ground surface is in this image?",
+    "Is this scene indoors or outdoors?",
+    "What is the lighting like in this scene?",
+    "What colors dominate the background?",
+]
 
 
-def _load_florence(device="cuda"):
-    """Load Florence-2 model and processor. Cached after first call."""
-    global _florence_model, _florence_processor
+def _load_blip(device="cuda"):
+    """Load BLIP-VQA model and processor. Cached after first call."""
+    global _blip_model, _blip_processor
 
-    if _florence_model is not None:
-        return _florence_model, _florence_processor
+    if _blip_model is not None:
+        return _blip_model, _blip_processor
 
-    from transformers import AutoProcessor, AutoModelForCausalLM
+    from transformers import BlipProcessor, BlipForQuestionAnswering
 
-    model_id = "microsoft/Florence-2-base"
-    print(f"Loading Florence-2 from {model_id}...")
+    model_id = "Salesforce/blip-vqa-base"
+    print(f"Loading BLIP-VQA from {model_id}...")
 
-    _florence_processor = AutoProcessor.from_pretrained(
-        model_id, trust_remote_code=True
-    )
-    _florence_model = AutoModelForCausalLM.from_pretrained(
-        model_id, trust_remote_code=True, torch_dtype=torch.float16
+    _blip_processor = BlipProcessor.from_pretrained(model_id)
+    _blip_model = BlipForQuestionAnswering.from_pretrained(
+        model_id, torch_dtype=torch.float16
     ).to(device).eval()
 
-    print("Florence-2 loaded successfully.")
-    return _florence_model, _florence_processor
+    print("BLIP-VQA loaded successfully.")
+    return _blip_model, _blip_processor
 
 
-def unload_florence():
-    """Free Florence-2 from GPU memory. Call this before running SD-2."""
-    global _florence_model, _florence_processor
-    if _florence_model is not None:
-        del _florence_model
-        _florence_model = None
-    if _florence_processor is not None:
-        del _florence_processor
-        _florence_processor = None
+def unload_caption_model():
+    """Free BLIP-VQA from GPU memory. Call this before running SD-2."""
+    global _blip_model, _blip_processor
+    if _blip_model is not None:
+        del _blip_model
+        _blip_model = None
+    if _blip_processor is not None:
+        del _blip_processor
+        _blip_processor = None
     torch.cuda.empty_cache()
-    print("Florence-2 unloaded, VRAM freed.")
+    print("BLIP-VQA unloaded, VRAM freed.")
+
+
+# Alias for pipeline.py compatibility
+unload_florence = unload_caption_model
+
+
+def _ask_blip(image, question, device="cuda"):
+    """
+    Ask BLIP-VQA a single question about the image.
+
+    Args:
+        image: PIL Image
+        question: str
+        device: cuda or cpu
+
+    Returns:
+        str — short answer (typically 1-4 words)
+    """
+    model, processor = _load_blip(device)
+
+    inputs = processor(
+        images=image, text=question, return_tensors="pt"
+    ).to(device, torch.float16)
+
+    with torch.no_grad():
+        output = model.generate(**inputs, max_new_tokens=30)
+
+    answer = processor.decode(output[0], skip_special_tokens=True).strip()
+    return answer
 
 
 def _extract_scene_tags(image, device="cuda"):
     """
-    Use Florence-2 to generate a detailed caption of the scene.
+    Ask multiple targeted questions to build a list of scene tags.
 
-    We use the <MORE_DETAILED_CAPTION> task which produces rich descriptions
-    of the scene context — lighting, materials, setting, atmosphere.
-
-    Args:
-        image: PIL Image — the ORIGINAL image (not masked)
-        device: cuda or cpu
+    Each question targets a different environmental aspect:
+      - Surface/flooring type
+      - Indoor/outdoor setting
+      - Lighting conditions
+      - Dominant colors
 
     Returns:
-        str — scene description tags
+        list of str — scene tags like ["tile", "outdoors", "bright", "green and white"]
     """
-    model, processor = _load_florence(device)
-
-    # Florence-2 uses task tokens to control output format
-    # <MORE_DETAILED_CAPTION> gives us the richest scene description
-    task = "<MORE_DETAILED_CAPTION>"
-
-    inputs = processor(text=task, images=image, return_tensors="pt")
-    # Move all tensor inputs to the right device
-    inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=60,
-            do_sample=False,  # deterministic — we want consistency
-        )
-
-    # Decode and clean up
-    raw = processor.decode(output[0], skip_special_tokens=True).strip()
-
-    # Florence-2 sometimes includes the task token in output — remove it
-    for prefix in ["<MORE_DETAILED_CAPTION>", "<DETAILED_CAPTION>", "<CAPTION>"]:
-        if raw.startswith(prefix):
-            raw = raw[len(prefix):].strip()
-
-    return raw
-
-
-def _caption_to_tags(caption):
-    """
-    Convert a natural language caption to SD-compatible comma-separated tags.
-
-    Florence-2 outputs sentences like "A modern outdoor patio with white tile
-    flooring and lush green plants under warm natural lighting."
-
-    We convert this to: "modern outdoor patio, white tile flooring, lush green
-    plants, warm natural lighting"
-
-    Simple approach: split on common delimiters and clean up.
-    """
-    import re
-
-    # Remove common filler phrases
-    filler = [
-        r'^(the |a |an )',
-        r'(the image shows |this is |there is |we can see )',
-        r'(in the background |in the foreground )',
-    ]
-    cleaned = caption.lower()
-    for pattern in filler:
-        cleaned = re.sub(pattern, '', cleaned)
-
-    # Split on sentence boundaries and common conjunctions
-    parts = re.split(r'[.;]|\band\b|\bwith\b|\bfeaturing\b|\bincluding\b', cleaned)
-
-    # Clean each part
     tags = []
-    for part in parts:
-        tag = part.strip().strip(',').strip()
-        # Skip empty or very short fragments
-        if len(tag) > 3:
-            tags.append(tag)
+    for question in SCENE_QUESTIONS:
+        answer = _ask_blip(image, question, device)
+        # Only keep non-empty, meaningful answers
+        if answer and len(answer) > 1:
+            tags.append(answer)
+    return tags
 
-    # Rejoin as comma-separated tags, limit to ~15 words total
-    result = ", ".join(tags)
-    words = result.split()
-    if len(words) > 20:
-        result = " ".join(words[:20])
 
-    return result
+def _format_tags(tags):
+    """
+    Convert raw BLIP answers into SD-compatible prompt fragments.
+
+    BLIP-VQA gives short answers like "tile", "outdoors", "bright".
+    We add context words to make them more useful as SD prompt tags:
+      "tile" -> "tile flooring"
+      "outdoors" -> "outdoors"  (already descriptive)
+      "bright" -> "bright lighting"
+      "green and white" -> "green and white tones"
+    """
+    formatted = []
+    # Map question index to a suffix that adds context
+    suffixes = ["flooring", "", "lighting", "tones"]
+
+    for i, tag in enumerate(tags):
+        tag = tag.lower().strip()
+        # Add suffix only if the answer doesn't already contain it
+        if i < len(suffixes) and suffixes[i]:
+            suffix = suffixes[i]
+            if suffix not in tag:
+                tag = f"{tag} {suffix}"
+        formatted.append(tag)
+
+    return formatted
 
 
 def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
     """
-    Enrich user prompt with scene context from Florence-2.
+    Enrich user prompt with scene context from BLIP-VQA.
 
     Args:
         image: PIL Image — original image (FULL, not masked)
-        mask: PIL Image — binary mask (not used for captioning, kept for API compat)
+        mask: PIL Image — binary mask (kept for API compatibility)
         user_prompt: str — the user's original short prompt
         device: str — cuda or cpu
 
@@ -160,20 +172,21 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         str — enriched prompt combining user intent + scene context
     """
     try:
-        # Step 1: Extract scene description from original image
-        raw_caption = _extract_scene_tags(image, device)
-        print(f"Florence-2 raw caption: {raw_caption}")
+        # Step 1: Extract scene tags via targeted questions
+        raw_tags = _extract_scene_tags(image, device)
+        print(f"BLIP-VQA raw tags: {raw_tags}")
 
-        # Step 2: Convert to SD-compatible tags
-        scene_tags = _caption_to_tags(raw_caption)
-        print(f"Scene tags: {scene_tags}")
-
-        if not scene_tags:
+        if not raw_tags:
             print("No scene tags extracted, using original prompt.")
             return user_prompt
 
-        # Step 3: Merge user prompt + scene context + quality boosters
-        enriched = f"{user_prompt}, {scene_tags}, masterpiece, photorealistic, high quality"
+        # Step 2: Format tags for SD prompt
+        formatted_tags = _format_tags(raw_tags)
+        scene_context = ", ".join(formatted_tags)
+        print(f"Scene context: {scene_context}")
+
+        # Step 3: Merge user prompt + scene context
+        enriched = f"{user_prompt}, {scene_context}"
         print(f"Enriched prompt: {enriched}")
 
         return enriched
