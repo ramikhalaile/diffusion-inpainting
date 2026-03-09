@@ -162,6 +162,11 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
     """
     Enrich user prompt with scene context from BLIP-VQA.
 
+    Uses Compel weighting syntax to keep the user's original prompt dominant.
+    The user prompt gets weight 1.3 (30% more attention) while scene tags
+    get default weight 1.0. This prevents scene tags from diluting the
+    user's intent — "wooden table" stays the main focus.
+
     Args:
         image: PIL Image — original image (FULL, not masked)
         mask: PIL Image — binary mask (kept for API compatibility)
@@ -169,7 +174,7 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         device: str — cuda or cpu
 
     Returns:
-        str — enriched prompt combining user intent + scene context
+        str — enriched prompt with Compel weighting syntax
     """
     try:
         # Step 1: Extract scene tags via targeted questions
@@ -185,8 +190,10 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         scene_context = ", ".join(formatted_tags)
         print(f"Scene context: {scene_context}")
 
-        # Step 3: Merge user prompt + scene context
-        enriched = f"{user_prompt}, {scene_context}"
+        # Step 3: Merge with Compel weighting syntax
+        # (user_prompt)1.3 gives 30% more attention to the user's intent
+        # Scene tags at default weight 1.0 provide context without dominating
+        enriched = f"({user_prompt})1.3, {scene_context}"
         print(f"Enriched prompt: {enriched}")
 
         return enriched
@@ -196,10 +203,3 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         print("Falling back to original prompt.")
         return user_prompt
 
-
-# Default negative prompt to suppress common inpainting artifacts
-NEGATIVE_PROMPT = (
-    "blurry, edge seam, border, watermark, low quality, "
-    "jpeg artifacts, pixelated, deformed, disfigured, "
-    "out of frame, bad anatomy, extra limbs"
-)

@@ -118,8 +118,16 @@ def run_all_conditions(
     print(f"Enriched prompt: {enriched_prompt}")
 
     # Pre-encode both prompts
+    # Original prompt: standard encoding (no weighting needed)
     text_emb_original = encode_text(prompt, tokenizer, text_encoder, device)
-    text_emb_enriched = encode_text(enriched_prompt, tokenizer, text_encoder, device)
+
+    # Enriched prompt: use Compel to handle (user_prompt)1.3 weighting syntax
+    # Compel parses weight annotations and produces properly weighted embeddings
+    from compel import Compel
+    compel_proc = Compel(tokenizer=tokenizer, text_encoder=text_encoder)
+    enriched_cond = compel_proc(enriched_prompt)          # [1, seq_len, dim]
+    enriched_uncond = compel_proc("")                      # [1, seq_len, dim]
+    text_emb_enriched = torch.cat([enriched_uncond, enriched_cond])  # [2, seq_len, dim]
 
     # Define the 8 conditions
     conditions = {
