@@ -1,23 +1,20 @@
 """
 Prompt enrichment using Florence-2-base-PromptGen-v2.0.
 
-Approach (based on comfyui-inpaint-nodes / Krita AI Diffusion recommendation):
-  1. Find the bounding box of the mask region
-  2. Expand bounding box by 1.5x in all directions — capture surrounding context
-  3. Crop the original image at the expanded bounding box
-  4. Fill the masked pixels within the crop with neutral gray (128, 128, 128)
-     — recommended by Acly (comfyui-inpaint-nodes) and Krita AI Diffusion wiki
+Approach:
+  1. Fill the masked region with neutral gray (128, 128, 128)
+     — recommended by Acly (comfyui-inpaint-nodes) and Krita AI Diffusion:
+       "allows generating anything without bias"
      — gray signals "nothing here" to the VLM without reconstruction artifacts
-  5. Run PromptGen v2.0 with <GENERATE_TAGS> on the prepared crop
-  6. Filter tags not relevant to real-world photography
-  7. Merge: (user_prompt)1.3, scene_tags, quality_tags
+  2. Run PromptGen v2.0 with <GENERATE_TAGS> on the gray-filled image
+  3. Filter tags not relevant to real-world photography
+  4. Merge: (user_prompt)1.3, scene_tags, quality_tags
 
-Model choice:
+Model:
   MiaoshouAI/Florence-2-base-PromptGen-v2.0
   - 1.09GB on disk, ~0.55GB VRAM at runtime
-  - Purpose-built for SD prompt generation, outputs comma-separated tags natively
+  - Purpose-built for SD prompt generation — outputs comma-separated tags natively
   - Compatible with transformers==4.45.0 via trust_remote_code=True
-  - Trained on curated Civitai images — outputs real-world SD-style tags
 
 Citation for neutral fill:
   Acly, "comfyui-inpaint-nodes", GitHub.
@@ -28,36 +25,29 @@ import torch
 import numpy as np
 from PIL import Image
 
-# ── Module-level cache ────────────────────────────────────────────────────────
+# ── Module-level model cache ──────────────────────────────────────────────────
 _pg_model = None
 _pg_processor = None
 
-# ── Quality boosters ─────────────────────────────────────────────────────────
+# ── Quality tags always appended ──────────────────────────────────────────────
 QUALITY_TAGS = "masterpiece, photorealistic, high quality, sharp focus"
 
 # ── Tags to filter out ────────────────────────────────────────────────────────
-# PromptGen was trained on Danbooru (anime) data — filter anime/human tags
-# that don't belong in real-world photography scene descriptions
+# PromptGen was trained on Danbooru (anime) data.
+# These tags appear on real-photo inputs but belong to anime/metadata domains.
 FILTER_TAGS = {
     "1girl", "1boy", "solo", "multiple girls", "multiple boys",
     "anime", "manga", "cartoon", "illustration", "drawing",
     "no humans", "simple background", "white background",
     "text", "watermark", "signature", "username", "artist name",
-    "na", "no human",
+    "na", "no human", "simple",
 }
 
-# Filter prefixes — drop any tag starting with these
 FILTER_PREFIXES = (
     "text:", "gender:", "eye_direction:", "image_composition:",
     "facing_direction", "facing viewer", "pants:", "hair:",
     "eyes:", "mouth:", "skin:", "expression:",
 )
-
-# ── Context crop factor ───────────────────────────────────────────────────────
-# How much to expand the mask bounding box before cropping
-# 1.5 = capture 50% extra context around the object on each side
-# Recommended range: 1.2–2.0 (comfyui-inpaint-nodes documentation)
-CONTEXT_EXPAND_FACTOR = 1.5
 
 
 def _load_promptgen(device="cuda"):
@@ -70,7 +60,7 @@ def _load_promptgen(device="cuda"):
     from transformers import AutoProcessor, AutoModelForCausalLM
 
     model_id = "MiaoshouAI/Florence-2-base-PromptGen-v2.0"
-    print(f"  Loading PromptGen v2.0 from {model_id}...")
+    print(f"  Loading PromptGen v2.0...")
 
     _pg_processor = AutoProcessor.from_pretrained(
         model_id, trust_remote_code=True
@@ -100,113 +90,38 @@ def unload_caption_model():
 unload_florence = unload_caption_model
 
 
-def _get_mask_bbox(mask):
+def _apply_neutral_fill(image, mask):
     """
-    Get bounding box of the BLACK (fill) region in the mask.
-
-    Args:
-        mask: PIL Image — binary mask (white=keep, black=fill)
-
-    Returns:
-        (x_min, y_min, x_max, y_max) in pixel coordinates
-        or None if no black region found
-    """
-    mask_np = np.array(mask.convert("L"))
-    fill_pixels = np.where(mask_np < 128)
-
-    if len(fill_pixels[0]) == 0:
-        return None
-
-    y_min, y_max = fill_pixels[0].min(), fill_pixels[0].max()
-    x_min, x_max = fill_pixels[1].min(), fill_pixels[1].max()
-
-    return x_min, y_min, x_max, y_max
-
-
-def _expand_bbox(bbox, expand_factor, img_w, img_h):
-    """
-    Expand bounding box by expand_factor in all directions.
-    Clamps to image boundaries.
-
-    Args:
-        bbox: (x_min, y_min, x_max, y_max)
-        expand_factor: float — 1.5 = expand by 50% on each side
-        img_w, img_h: image dimensions
-
-    Returns:
-        (x_min, y_min, x_max, y_max) expanded and clamped
-    """
-    x_min, y_min, x_max, y_max = bbox
-
-    w = x_max - x_min
-    h = y_max - y_min
-
-    pad_x = int(w * (expand_factor - 1) / 2)
-    pad_y = int(h * (expand_factor - 1) / 2)
-
-    x_min_exp = max(0, x_min - pad_x)
-    y_min_exp = max(0, y_min - pad_y)
-    x_max_exp = min(img_w, x_max + pad_x)
-    y_max_exp = min(img_h, y_max + pad_y)
-
-    return x_min_exp, y_min_exp, x_max_exp, y_max_exp
-
-
-def _prepare_context_crop(image, mask):
-    """
-    Prepare the context crop for PromptGen input.
-
-    Steps:
-      1. Find mask bounding box
-      2. Expand by CONTEXT_EXPAND_FACTOR
-      3. Crop original image at expanded bbox
-      4. Fill mask pixels in crop with neutral gray (128, 128, 128)
+    Fill the masked region with neutral gray (128, 128, 128).
 
     Args:
         image: PIL Image — original image
-        mask: PIL Image — binary mask (white=keep, black=fill)
+        mask:  PIL Image — binary mask (white=keep, black=fill)
 
     Returns:
-        PIL Image — context crop ready for PromptGen
+        PIL Image — image with mask region replaced by gray
     """
-    img_w, img_h = image.size
-    bbox = _get_mask_bbox(mask)
+    image_np = np.array(image.convert("RGB")).copy()
+    mask_np  = np.array(mask.convert("L"))
 
-    if bbox is None:
-        print("  No mask region found — using full image")
-        return image
+    # Black pixels in mask = fill region → replace with gray
+    image_np[mask_np < 128] = [128, 128, 128]
 
-    x_min, y_min, x_max, y_max = _expand_bbox(
-        bbox, CONTEXT_EXPAND_FACTOR, img_w, img_h
-    )
-
-    print(f"  Mask bbox: {bbox}")
-    print(f"  Expanded crop: ({x_min},{y_min}) -> ({x_max},{y_max})")
-
-    # Crop original image
-    crop = image.crop((x_min, y_min, x_max, y_max))
-    crop_np = np.array(crop).copy()
-
-    # Fill mask pixels within crop with neutral gray
-    mask_crop = mask.crop((x_min, y_min, x_max, y_max))
-    mask_np = np.array(mask_crop.convert("L"))
-    crop_np[mask_np < 128] = [128, 128, 128]
-
-    return Image.fromarray(crop_np)
+    return Image.fromarray(image_np)
 
 
-def _run_promptgen(context_crop, device="cuda"):
+def _run_promptgen(filled_image, device="cuda"):
     """
-    Run PromptGen v2.0 with <GENERATE_TAGS> on the context crop.
+    Run PromptGen v2.0 with <GENERATE_TAGS> on the gray-filled image.
 
     Returns:
-        list of str — raw tags from PromptGen
+        list of str — raw tags
     """
     model, processor = _load_promptgen(device)
 
     inputs = processor(
         text="<GENERATE_TAGS>",
-        images=context_crop,
+        images=filled_image,
         return_tensors="pt"
     ).to(device, torch.float16)
 
@@ -226,7 +141,7 @@ def _run_promptgen(context_crop, device="cuda"):
     parsed = processor.post_process_generation(
         result,
         task="<GENERATE_TAGS>",
-        image_size=(context_crop.width, context_crop.height)
+        image_size=(filled_image.width, filled_image.height)
     )
 
     raw_tags = parsed.get("<GENERATE_TAGS>", "")
@@ -234,19 +149,15 @@ def _run_promptgen(context_crop, device="cuda"):
 
 
 def _filter_tags(tags):
-    """
-    Remove anime/human/metadata tags irrelevant to real-world photography.
-    """
+    """Remove anime/human/metadata tags irrelevant to real-world photography."""
     filtered = []
     for tag in tags:
         tag_lower = tag.lower().strip()
 
         if tag_lower in FILTER_TAGS:
             continue
-
         if any(tag_lower.startswith(p) for p in FILTER_PREFIXES):
             continue
-
         if len(tag_lower) <= 1:
             continue
 
@@ -260,28 +171,27 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
     Enrich user prompt with scene context from PromptGen v2.0.
 
     Pipeline:
-      1. Prepare context crop (neutral fill + 1.5x expansion)
-      2. Run PromptGen <GENERATE_TAGS> on crop
+      1. Fill mask region with neutral gray
+      2. Run PromptGen <GENERATE_TAGS> on filled image
       3. Filter anime/metadata tags
-      4. Merge with Compel weighting:
-         (user_prompt)1.3, scene_tags, quality_tags
+      4. Merge: (user_prompt)1.3, scene_tags, quality_tags
 
     Args:
-        image: PIL Image — original image (not masked)
-        mask: PIL Image — binary mask (white=keep, black=fill)
+        image:       PIL Image — original image
+        mask:        PIL Image — binary mask (white=keep, black=fill)
         user_prompt: str
-        device: str
+        device:      str
 
     Returns:
         str — enriched prompt with Compel weighting syntax
     """
     try:
-        print("  [Enrichment] Preparing context crop...")
-        context_crop = _prepare_context_crop(image, mask)
+        print("  [Enrichment] Applying neutral gray fill to mask region...")
+        filled_image = _apply_neutral_fill(image, mask)
 
-        print("  [Enrichment] Running PromptGen v2.0...")
-        raw_tags = _run_promptgen(context_crop, device)
-        print(f"  [Enrichment] Raw tags: {raw_tags}")
+        print("  [Enrichment] Running PromptGen v2.0 <GENERATE_TAGS>...")
+        raw_tags = _run_promptgen(filled_image, device)
+        print(f"  [Enrichment] Raw tags:      {raw_tags}")
 
         filtered_tags = _filter_tags(raw_tags)
         print(f"  [Enrichment] Filtered tags: {filtered_tags}")
@@ -292,10 +202,10 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
 
         scene_context = ", ".join(filtered_tags)
         enriched = f"({user_prompt})1.3, {scene_context}, {QUALITY_TAGS}"
-        print(f"  [Enrichment] Final prompt: {enriched}")
+        print(f"  [Enrichment] Final prompt:  {enriched}")
 
         return enriched
 
     except Exception as e:
-        print(f"  [Enrichment] Failed: {e} — falling back.")
+        print(f"  [Enrichment] Failed: {e} — falling back to original prompt.")
         return f"({user_prompt})1.3, {QUALITY_TAGS}"
