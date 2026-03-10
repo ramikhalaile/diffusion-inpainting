@@ -1,337 +1,274 @@
 """
-Prompt enrichment using BLIP-VQA with two-stage adaptive questioning.
+Prompt enrichment using Florence-2-base-PromptGen-v2.0.
 
-Design principles:
-  1. Stage 1 — classify scene type (indoor / outdoor / nature)
-  2. Stage 2 — ask scene-specific questions whose answers are
-               STRUCTURALLY IMPOSSIBLE to be about the removed object.
-               e.g. "What material is the floor?" cannot be answered
-               with "a bottle" or "a speaker".
-  3. Post-process — convert raw short answers into SD-quality prompt tags
-  4. Filter — remove garbage answers before they reach the prompt
+Approach (based on comfyui-inpaint-nodes / Krita AI Diffusion recommendation):
+  1. Find the bounding box of the mask region
+  2. Expand bounding box by 1.5x in all directions — capture surrounding context
+  3. Crop the original image at the expanded bounding box
+  4. Fill the masked pixels within the crop with neutral gray (128, 128, 128)
+     — recommended by Acly (comfyui-inpaint-nodes) and Krita AI Diffusion wiki
+     — gray signals "nothing here" to the VLM without reconstruction artifacts
+  5. Run PromptGen v2.0 with <GENERATE_TAGS> on the prepared crop
+  6. Filter tags not relevant to real-world photography
+  7. Merge: (user_prompt)1.3, scene_tags, quality_tags
 
-Model choice rationale:
-  BLIP-VQA-base (~1GB) was chosen for hardware compatibility alongside
-  SD-2 (~5GB) on a 24GB VRAM budget. PromptGen v2.0 would be optimal
-  but requires transformers==4.38.0 which conflicts with SD-2 dependencies.
+Model choice:
+  MiaoshouAI/Florence-2-base-PromptGen-v2.0
+  - 1.09GB on disk, ~0.55GB VRAM at runtime
+  - Purpose-built for SD prompt generation, outputs comma-separated tags natively
+  - Compatible with transformers==4.45.0 via trust_remote_code=True
+  - Trained on curated Civitai images — outputs real-world SD-style tags
+
+Citation for neutral fill:
+  Acly, "comfyui-inpaint-nodes", GitHub.
+  Krita AI Diffusion wiki: neutral fill "allows generating anything without bias."
 """
 
 import torch
-from PIL import Image
 import numpy as np
+from PIL import Image
 
-# ─── MODULE-LEVEL CACHE ──────────────────────────────────────────────────────
-_blip_model = None
-_blip_processor = None
+# ── Module-level cache ────────────────────────────────────────────────────────
+_pg_model = None
+_pg_processor = None
 
-# ─── QUALITY BOOSTERS ────────────────────────────────────────────────────────
-# Always appended — these consistently improve SD-2 output quality
+# ── Quality boosters ─────────────────────────────────────────────────────────
 QUALITY_TAGS = "masterpiece, photorealistic, high quality, sharp focus"
 
-# ─── GARBAGE FILTER ─────────────────────────────────────────────────────────
-# BLIP sometimes outputs these non-answers — discard them
-GARBAGE_ANSWERS = {
-    "unknown", "unclear", "none", "n/a", "yes", "no",
-    "i don't know", "i do not know", "not sure", "cannot tell",
-    "it is", "there is", "this is", "the image", "the photo",
+# ── Tags to filter out ────────────────────────────────────────────────────────
+# PromptGen was trained on Danbooru (anime) data — filter anime/human tags
+# that don't belong in real-world photography scene descriptions
+FILTER_TAGS = {
+    "1girl", "1boy", "solo", "multiple girls", "multiple boys",
+    "anime", "manga", "cartoon", "illustration", "drawing",
+    "no humans", "simple background", "white background",
+    "text", "watermark", "signature", "username", "artist name",
+    "na", "no human",
 }
 
-# ─── STAGE 1: SCENE CLASSIFICATION ──────────────────────────────────────────
-# One question to branch the rest of the pipeline.
-# Two backup questions in case the first answer is ambiguous.
-SCENE_TYPE_QUESTIONS = [
-    "Is this photo taken indoors or outdoors?",
-    "Is there a ceiling visible in this image?",   # backup: yes=indoor, no=outdoor
-    "Is this image inside a building or outside?",  # backup
-]
+# Filter prefixes — drop any tag starting with these
+FILTER_PREFIXES = (
+    "text:", "gender:", "eye_direction:", "image_composition:",
+    "facing_direction", "facing viewer", "pants:", "hair:",
+    "eyes:", "mouth:", "skin:", "expression:",
+)
 
-# ─── STAGE 2: SCENE-SPECIFIC QUESTION BANKS ──────────────────────────────────
-# Each question is designed so its answer CANNOT be the removed object.
-# Rule: answers describe the permanent environment, not foreground subjects.
-
-INDOOR_QUESTIONS = [
-    # Floor — cannot answer "bottle" or "speaker"
-    ("What material is the floor made of?",         "flooring"),
-    # Wall color — environmental, not object
-    ("What color are the walls in this room?",       "walls"),
-    # Room type — gives scene context for SD
-    ("What type of room is this?",                   "room"),
-    # Interior style — helps SD match aesthetic
-    ("How would you describe the interior design style?", "style"),
-    # Lighting — critical for SD realism
-    ("Is the lighting in this room natural or artificial?", "lighting"),
-]
-
-OUTDOOR_QUESTIONS = [
-    # Ground — cannot answer with object name
-    ("What type of ground surface is visible?",      "ground"),
-    # Sky — pure environment, never describes foreground objects
-    ("What is the sky like in this image?",          "sky"),
-    # Vegetation — structural background detail
-    ("What type of vegetation or plants are visible?", "vegetation"),
-    # Time of day — affects SD's lighting model
-    ("What time of day does this image appear to be taken?", "time of day"),
-    # Architecture — background context
-    ("What type of structures or buildings are visible in the background?", "architecture"),
-]
-
-NATURE_QUESTIONS = [
-    ("What type of natural surface is on the ground?", "ground"),
-    ("What is the sky like?",                          "sky"),
-    ("What type of trees or plants are present?",      "vegetation"),
-    ("What season does this image appear to be taken in?", "season"),
-    ("Is this a garden, forest, park, or field?",      "setting"),
-]
-
-# ─── ANSWER → TAG CONVERSION ─────────────────────────────────────────────────
-# Maps raw BLIP answers to SD-quality prompt fragments.
-# Handles the most common short answers BLIP produces.
-
-ANSWER_REWRITES = {
-    # Flooring
-    "tile": "tile flooring", "tiles": "tile flooring",
-    "wood": "wooden floor", "wooden": "wooden floor", "hardwood": "hardwood floor",
-    "marble": "marble floor", "carpet": "carpeted floor",
-    "concrete": "concrete floor", "stone": "stone floor",
-    "laminate": "laminate flooring", "vinyl": "vinyl floor",
-
-    # Wall colors
-    "white": "white walls", "gray": "gray walls", "grey": "gray walls",
-    "beige": "beige walls", "cream": "cream walls",
-    "blue": "blue walls", "green": "green walls", "yellow": "yellow walls",
-
-    # Rooms
-    "kitchen": "kitchen interior", "bathroom": "bathroom interior",
-    "bedroom": "bedroom interior", "living room": "living room interior",
-    "hallway": "hallway interior", "entrance": "entrance hallway",
-    "office": "office interior", "dining room": "dining room interior",
-
-    # Interior style
-    "modern": "modern interior", "minimalist": "minimalist interior",
-    "classic": "classic interior", "traditional": "traditional interior",
-    "contemporary": "contemporary design", "industrial": "industrial style",
-
-    # Lighting
-    "natural": "natural lighting", "artificial": "artificial lighting",
-    "bright": "bright lighting", "dim": "dim lighting",
-    "warm": "warm lighting", "cool": "cool lighting",
-    "sunlight": "natural sunlight", "daylight": "daylight",
-
-    # Ground (outdoor)
-    "grass": "grass ground", "gravel": "gravel surface",
-    "pavement": "paved surface", "asphalt": "asphalt surface",
-    "dirt": "dirt ground", "sand": "sandy ground",
-    "cobblestone": "cobblestone surface", "brick": "brick ground",
-
-    # Sky
-    "clear": "clear blue sky", "cloudy": "cloudy sky",
-    "overcast": "overcast sky", "blue": "clear blue sky",
-    "sunny": "sunny sky", "gray": "gray overcast sky",
-
-    # Vegetation
-    "trees": "trees in background", "bushes": "bushes and shrubs",
-    "grass": "grass and lawn", "flowers": "flowering plants",
-    "none": None,  # explicitly discard
-
-    # Time of day
-    "daytime": "daytime", "morning": "morning light",
-    "afternoon": "afternoon light", "evening": "evening light",
-    "night": "night scene",
-
-    # Season
-    "summer": "summer", "winter": "winter", "autumn": "autumn",
-    "fall": "autumn", "spring": "spring",
-}
+# ── Context crop factor ───────────────────────────────────────────────────────
+# How much to expand the mask bounding box before cropping
+# 1.5 = capture 50% extra context around the object on each side
+# Recommended range: 1.2–2.0 (comfyui-inpaint-nodes documentation)
+CONTEXT_EXPAND_FACTOR = 1.5
 
 
-# ─── MODEL LOADING ────────────────────────────────────────────────────────────
+def _load_promptgen(device="cuda"):
+    """Load PromptGen v2.0. Cached after first call."""
+    global _pg_model, _pg_processor
 
-def _load_blip(device="cuda"):
-    """Load BLIP-VQA model and processor. Cached after first call."""
-    global _blip_model, _blip_processor
-    if _blip_model is not None:
-        return _blip_model, _blip_processor
+    if _pg_model is not None:
+        return _pg_model, _pg_processor
 
-    from transformers import BlipProcessor, BlipForQuestionAnswering
-    model_id = "Salesforce/blip-vqa-base"
-    print(f"  Loading BLIP-VQA from {model_id}...")
+    from transformers import AutoProcessor, AutoModelForCausalLM
 
-    _blip_processor = BlipProcessor.from_pretrained(model_id)
-    _blip_model = BlipForQuestionAnswering.from_pretrained(
-        model_id, torch_dtype=torch.float16
+    model_id = "MiaoshouAI/Florence-2-base-PromptGen-v2.0"
+    print(f"  Loading PromptGen v2.0 from {model_id}...")
+
+    _pg_processor = AutoProcessor.from_pretrained(
+        model_id, trust_remote_code=True
+    )
+    _pg_model = AutoModelForCausalLM.from_pretrained(
+        model_id, trust_remote_code=True, torch_dtype=torch.float16
     ).to(device).eval()
 
-    print("  BLIP-VQA ready.")
-    return _blip_model, _blip_processor
+    vram = torch.cuda.memory_allocated() / 1e9
+    print(f"  PromptGen v2.0 loaded. VRAM: {vram:.2f}GB")
+    return _pg_model, _pg_processor
 
 
 def unload_caption_model():
-    """Free BLIP-VQA from GPU. Call before loading SD-2."""
-    global _blip_model, _blip_processor
-    if _blip_model is not None:
-        del _blip_model
-        _blip_model = None
-    if _blip_processor is not None:
-        del _blip_processor
-        _blip_processor = None
+    """Free PromptGen from GPU. Call before loading SD-2."""
+    global _pg_model, _pg_processor
+    if _pg_model is not None:
+        del _pg_model
+        _pg_model = None
+    if _pg_processor is not None:
+        del _pg_processor
+        _pg_processor = None
     torch.cuda.empty_cache()
-    print("  BLIP-VQA unloaded — VRAM freed.")
+    print("  PromptGen unloaded — VRAM freed.")
 
-# Alias kept for pipeline.py compatibility
+# Alias for pipeline.py compatibility
 unload_florence = unload_caption_model
 
 
-# ─── VQA CORE ────────────────────────────────────────────────────────────────
+def _get_mask_bbox(mask):
+    """
+    Get bounding box of the BLACK (fill) region in the mask.
 
-def _ask(image, question, device="cuda"):
+    Args:
+        mask: PIL Image — binary mask (white=keep, black=fill)
+
+    Returns:
+        (x_min, y_min, x_max, y_max) in pixel coordinates
+        or None if no black region found
     """
-    Ask BLIP-VQA one question. Returns lowercased stripped answer.
-    Returns None if answer is garbage or too long.
+    mask_np = np.array(mask.convert("L"))
+    fill_pixels = np.where(mask_np < 128)
+
+    if len(fill_pixels[0]) == 0:
+        return None
+
+    y_min, y_max = fill_pixels[0].min(), fill_pixels[0].max()
+    x_min, x_max = fill_pixels[1].min(), fill_pixels[1].max()
+
+    return x_min, y_min, x_max, y_max
+
+
+def _expand_bbox(bbox, expand_factor, img_w, img_h):
     """
-    model, processor = _load_blip(device)
+    Expand bounding box by expand_factor in all directions.
+    Clamps to image boundaries.
+
+    Args:
+        bbox: (x_min, y_min, x_max, y_max)
+        expand_factor: float — 1.5 = expand by 50% on each side
+        img_w, img_h: image dimensions
+
+    Returns:
+        (x_min, y_min, x_max, y_max) expanded and clamped
+    """
+    x_min, y_min, x_max, y_max = bbox
+
+    w = x_max - x_min
+    h = y_max - y_min
+
+    pad_x = int(w * (expand_factor - 1) / 2)
+    pad_y = int(h * (expand_factor - 1) / 2)
+
+    x_min_exp = max(0, x_min - pad_x)
+    y_min_exp = max(0, y_min - pad_y)
+    x_max_exp = min(img_w, x_max + pad_x)
+    y_max_exp = min(img_h, y_max + pad_y)
+
+    return x_min_exp, y_min_exp, x_max_exp, y_max_exp
+
+
+def _prepare_context_crop(image, mask):
+    """
+    Prepare the context crop for PromptGen input.
+
+    Steps:
+      1. Find mask bounding box
+      2. Expand by CONTEXT_EXPAND_FACTOR
+      3. Crop original image at expanded bbox
+      4. Fill mask pixels in crop with neutral gray (128, 128, 128)
+
+    Args:
+        image: PIL Image — original image
+        mask: PIL Image — binary mask (white=keep, black=fill)
+
+    Returns:
+        PIL Image — context crop ready for PromptGen
+    """
+    img_w, img_h = image.size
+    bbox = _get_mask_bbox(mask)
+
+    if bbox is None:
+        print("  No mask region found — using full image")
+        return image
+
+    x_min, y_min, x_max, y_max = _expand_bbox(
+        bbox, CONTEXT_EXPAND_FACTOR, img_w, img_h
+    )
+
+    print(f"  Mask bbox: {bbox}")
+    print(f"  Expanded crop: ({x_min},{y_min}) -> ({x_max},{y_max})")
+
+    # Crop original image
+    crop = image.crop((x_min, y_min, x_max, y_max))
+    crop_np = np.array(crop).copy()
+
+    # Fill mask pixels within crop with neutral gray
+    mask_crop = mask.crop((x_min, y_min, x_max, y_max))
+    mask_np = np.array(mask_crop.convert("L"))
+    crop_np[mask_np < 128] = [128, 128, 128]
+
+    return Image.fromarray(crop_np)
+
+
+def _run_promptgen(context_crop, device="cuda"):
+    """
+    Run PromptGen v2.0 with <GENERATE_TAGS> on the context crop.
+
+    Returns:
+        list of str — raw tags from PromptGen
+    """
+    model, processor = _load_promptgen(device)
 
     inputs = processor(
-        images=image, text=question, return_tensors="pt"
+        text="<GENERATE_TAGS>",
+        images=context_crop,
+        return_tensors="pt"
     ).to(device, torch.float16)
 
     with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=12)
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=256,
+            do_sample=False,
+            num_beams=3
+        )
 
-    answer = processor.decode(output[0], skip_special_tokens=True).strip().lower()
+    result = processor.batch_decode(
+        generated_ids, skip_special_tokens=False
+    )[0]
 
-    # Discard garbage answers
-    if not answer or len(answer) < 2:
-        return None
-    if answer in GARBAGE_ANSWERS:
-        return None
-    # Discard overly long answers — BLIP hallucinating sentences
-    if len(answer.split()) > 5:
-        return None
+    parsed = processor.post_process_generation(
+        result,
+        task="<GENERATE_TAGS>",
+        image_size=(context_crop.width, context_crop.height)
+    )
 
-    return answer
+    raw_tags = parsed.get("<GENERATE_TAGS>", "")
+    return [t.strip() for t in raw_tags.split(",") if t.strip()]
 
 
-# ─── STAGE 1: CLASSIFY SCENE ─────────────────────────────────────────────────
-
-def _classify_scene(image, device="cuda"):
+def _filter_tags(tags):
     """
-    Determine scene type: 'indoor', 'outdoor', or 'nature'.
-    Uses primary question + two backup questions for robustness.
-
-    Returns: str — 'indoor', 'outdoor', or 'nature'
+    Remove anime/human/metadata tags irrelevant to real-world photography.
     """
-    # Primary question
-    answer = _ask(image, SCENE_TYPE_QUESTIONS[0], device)
+    filtered = []
+    for tag in tags:
+        tag_lower = tag.lower().strip()
 
-    if answer:
-        if any(w in answer for w in ["indoor", "inside", "interior", "indoors"]):
-            return "indoor"
-        if any(w in answer for w in ["outdoor", "outside", "exterior", "outdoors"]):
-            return "outdoor"
-
-    # Backup 1: ceiling question
-    answer = _ask(image, SCENE_TYPE_QUESTIONS[1], device)
-    if answer:
-        if "yes" in answer:
-            return "indoor"
-        if "no" in answer:
-            return "outdoor"
-
-    # Backup 2: building question
-    answer = _ask(image, SCENE_TYPE_QUESTIONS[2], device)
-    if answer:
-        if "inside" in answer or "building" in answer:
-            return "indoor"
-        if "outside" in answer:
-            return "outdoor"
-
-    # Default: outdoor (more common in ambiguous cases)
-    print("  Scene classification ambiguous — defaulting to outdoor")
-    return "outdoor"
-
-
-# ─── STAGE 2: SCENE-SPECIFIC QUESTIONS ───────────────────────────────────────
-
-def _ask_scene_questions(image, scene_type, device="cuda"):
-    """
-    Ask the right set of questions based on scene type.
-    Returns list of (raw_answer, semantic_role) tuples.
-    """
-    if scene_type == "indoor":
-        question_bank = INDOOR_QUESTIONS
-    elif scene_type == "nature":
-        question_bank = NATURE_QUESTIONS
-    else:
-        question_bank = OUTDOOR_QUESTIONS
-
-    results = []
-    for question, role in question_bank:
-        answer = _ask(image, question, device)
-        if answer:
-            results.append((answer, role))
-            print(f"    [{role}] Q: {question[:50]}... → '{answer}'")
-
-    return results
-
-
-# ─── ANSWER POST-PROCESSING ───────────────────────────────────────────────────
-
-def _answers_to_tags(raw_answers):
-    """
-    Convert (answer, role) pairs to SD-quality prompt tags.
-
-    Strategy:
-      1. Check ANSWER_REWRITES lookup table first
-      2. If not found, construct tag from answer + role as fallback
-      3. Deduplicate tags
-      4. Filter None values (explicitly discarded answers)
-    """
-    tags = []
-    seen = set()
-
-    for answer, role in raw_answers:
-        # Try exact match in rewrite table
-        tag = ANSWER_REWRITES.get(answer, None)
-
-        if tag is None and answer not in ANSWER_REWRITES:
-            # Not in table — construct from role context
-            # e.g. answer="travertine", role="flooring" → "travertine flooring"
-            if role and role not in answer:
-                tag = f"{answer} {role}"
-            else:
-                tag = answer
-
-        # Skip explicitly discarded answers (mapped to None in ANSWER_REWRITES)
-        if tag is None:
+        if tag_lower in FILTER_TAGS:
             continue
 
-        # Deduplicate
-        if tag not in seen:
-            seen.add(tag)
-            tags.append(tag)
+        if any(tag_lower.startswith(p) for p in FILTER_PREFIXES):
+            continue
 
-    return tags
+        if len(tag_lower) <= 1:
+            continue
 
+        filtered.append(tag)
 
-# ─── MAIN ENTRY POINT ────────────────────────────────────────────────────────
+    return filtered
+
 
 def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
     """
-    Enrich user prompt with scene context using two-stage adaptive BLIP-VQA.
+    Enrich user prompt with scene context from PromptGen v2.0.
 
-    Stage 1: Classify scene type (indoor / outdoor / nature)
-    Stage 2: Ask scene-appropriate questions — answers cannot describe the object
-    Stage 3: Convert answers to SD tags
-    Stage 4: Merge with Compel weighting
-
-    Compel weighting strategy:
-      (user_prompt)1.3  — user intent dominates
-      scene tags        — weight 1.0, provide context
-      quality tags      — always appended
+    Pipeline:
+      1. Prepare context crop (neutral fill + 1.5x expansion)
+      2. Run PromptGen <GENERATE_TAGS> on crop
+      3. Filter anime/metadata tags
+      4. Merge with Compel weighting:
+         (user_prompt)1.3, scene_tags, quality_tags
 
     Args:
-        image: PIL Image — full original image (not masked)
-        mask: PIL Image — kept for API compatibility, not used
+        image: PIL Image — original image (not masked)
+        mask: PIL Image — binary mask (white=keep, black=fill)
         user_prompt: str
         device: str
 
@@ -339,32 +276,26 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
         str — enriched prompt with Compel weighting syntax
     """
     try:
-        print("  [Enrichment] Stage 1: Classifying scene...")
-        scene_type = _classify_scene(image, device)
-        print(f"  [Enrichment] Scene type: {scene_type}")
+        print("  [Enrichment] Preparing context crop...")
+        context_crop = _prepare_context_crop(image, mask)
 
-        print("  [Enrichment] Stage 2: Asking scene-specific questions...")
-        raw_answers = _ask_scene_questions(image, scene_type, device)
+        print("  [Enrichment] Running PromptGen v2.0...")
+        raw_tags = _run_promptgen(context_crop, device)
+        print(f"  [Enrichment] Raw tags: {raw_tags}")
 
-        if not raw_answers:
-            print("  [Enrichment] No answers extracted — using original prompt.")
+        filtered_tags = _filter_tags(raw_tags)
+        print(f"  [Enrichment] Filtered tags: {filtered_tags}")
+
+        if not filtered_tags:
+            print("  [Enrichment] No useful tags — using original prompt + quality.")
             return f"({user_prompt})1.3, {QUALITY_TAGS}"
 
-        print("  [Enrichment] Stage 3: Converting answers to SD tags...")
-        tags = _answers_to_tags(raw_answers)
-        print(f"  [Enrichment] Final tags: {tags}")
-
-        if not tags:
-            return f"({user_prompt})1.3, {QUALITY_TAGS}"
-
-        # Build enriched prompt
-        # Structure: (user intent dominates), scene context, quality boosters
-        scene_context = ", ".join(tags)
+        scene_context = ", ".join(filtered_tags)
         enriched = f"({user_prompt})1.3, {scene_context}, {QUALITY_TAGS}"
-        print(f"  [Enrichment] Enriched: {enriched}")
+        print(f"  [Enrichment] Final prompt: {enriched}")
 
         return enriched
 
     except Exception as e:
-        print(f"  [Enrichment] Failed: {e} — falling back to original.")
+        print(f"  [Enrichment] Failed: {e} — falling back.")
         return f"({user_prompt})1.3, {QUALITY_TAGS}"
