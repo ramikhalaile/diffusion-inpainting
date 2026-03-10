@@ -1,6 +1,6 @@
 PROMPTS = {
-    "image01": "a clean gray tiled wall and floor",
-    "image02": "a clean home entrance with white wall and light tile floor",
+    "image01": "a glass bottle of fresh orange juice with a white cap sitting on a light gray counter, natural lighting, kitchen setting",
+    "image02": "A tall fiddle leaf fig plant in a modern ceramic pot on a wooden stand against a white wall below a gold sunburst mirror in an elegant entryway",
     "image03": "tree branches with leaves against a stone building and garden",
     "image04": "a white ceiling with a hanging lamp in a modern living room",
     "image05": "an empty outdoor patio with pergola and stone wall",
