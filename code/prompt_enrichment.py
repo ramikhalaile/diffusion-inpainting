@@ -292,7 +292,13 @@ def get_enriched_prompt(image, mask, user_prompt, device="cuda"):
             return f"({user_prompt})1.3, {QUALITY_TAGS}"
 
         # Step 5: Build final prompt
-        enriched = f"({user_prompt})1.3, harmonized into a scene of {scene_context}, {QUALITY_TAGS}"
+        # We specify that these are EXISTING background elements to prevent the model from adding them as new objects.
+        enriched = (
+            f"({user_prompt})1.3, harmonized into the existing background scene context: "
+            f"{scene_context}. (The background is for lighting, atmosphere, and style reference only; "
+            "do not add or re-generate these background objects), "
+            f"{QUALITY_TAGS}"
+        )
         print(f"  [Enrichment] Final prompt:  {enriched}")
 
         return enriched
